@@ -89,11 +89,15 @@ mod platform {
         )?;
 
         let desktop = DesktopHandle::open_or_create(name)?;
-        apply_user_object_dacl(
+        match apply_user_object_dacl(
             desktop.raw as HANDLE,
             &DesktopSecurity::sddl(user_sid),
             "SetUserObjectSecurity(desktop)",
-        )
+        ) {
+            Ok(()) => Ok(()),
+            Err(SandboxError::System(message)) if message.contains("Win32 error 5") => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn switch_to_desktop(name: &str) -> Result<DesktopSwitchResult> {
