@@ -1,0 +1,12 @@
+{
+  "apps": [
+    {
+      "id": "cmd-exit",
+      "name": "Command Prompt Exit Smoke",
+      "exe_path": "C:\\Windows\\System32\\cmd.exe",
+      "args": ["/c", "exit", "0"],
+      "timeout_seconds": 1,
+      "notes": "Non-interactive smoke case for POC-0105 manifest parsing and process launch."
+    }
+  ]
+}

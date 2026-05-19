@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "crates/sandbox-audit",
+    "crates/sandbox-agent",
+    "crates/sandbox-compat-poc",
+    "crates/sandbox-common",
+    "crates/sandbox-desktop",
+    "crates/sandbox-desktop-poc",
+    "crates/sandbox-ipc",
+    "crates/sandbox-launcher",
+    "crates/sandbox-manager",
+    "crates/sandbox-net",
+    "crates/sandbox-network-poc",
+    "crates/sandbox-policy",
+    "crates/sandbox-service",
+    "crates/sandbox-shell",
+    "crates/sandbox-token-poc",
+    "crates/sandbox-tunnel-poc",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Proprietary"
+publish = false
+version = "0.1.0"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+uuid = { version = "1.8", features = ["serde", "v4"] }
+windows-sys = "0.59"

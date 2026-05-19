@@ -1,0 +1,49 @@
+{
+  "version": "dev-policy",
+  "apps": [
+    {
+      "id": "cmd-exit",
+      "name": "Command Smoke",
+      "exe_path": "cmd.exe",
+      "args": ["/c", "exit 0"],
+      "hash_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "network_profile": "IntranetOnly"
+    },
+    {
+      "id": "notepad",
+      "name": "Notepad",
+      "exe_path": "notepad.exe",
+      "hash_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "network_profile": "IntranetOnly"
+    }
+  ],
+  "network": {
+    "intranet_cidrs": [],
+    "dns_servers": [],
+    "block_ipv6": true,
+    "block_public_internet": true,
+    "block_unapproved_proxy": true
+  },
+  "filesystem": {
+    "sandbox_root": "C:\\ProgramData\\SandboxPlus\\Profiles",
+    "allow_import": false,
+    "allow_export": false,
+    "denied_host_paths": [
+      "C:\\Users",
+      "C:\\ProgramData"
+    ]
+  },
+  "clipboard": {
+    "allow_cross_boundary": false,
+    "allow_plain_text_only": false
+  },
+  "printing": {
+    "allow_printing": false,
+    "require_watermark": true
+  },
+  "audit": {
+    "enabled": true,
+    "fail_closed_on_write_error": true,
+    "local_retention_days": 30
+  }
+}

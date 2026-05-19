@@ -1,0 +1,11 @@
+/target
+.idea/
+.vscode/
+*.rs.bk
+*.user
+Thumbs.db
+.DS_Store
+
+# .NET Build Artifacts
+**/bin/
+**/obj/

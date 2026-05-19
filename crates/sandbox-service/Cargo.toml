@@ -1,0 +1,23 @@
+[package]
+name = "sandbox-service"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+sandbox-common = { path = "../sandbox-common" }
+sandbox-audit = { path = "../sandbox-audit" }
+sandbox-desktop = { path = "../sandbox-desktop" }
+sandbox-ipc = { path = "../sandbox-ipc" }
+sandbox-launcher = { path = "../sandbox-launcher" }
+sandbox-net = { path = "../sandbox-net" }
+serde_json.workspace = true
+uuid.workspace = true
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+] }
