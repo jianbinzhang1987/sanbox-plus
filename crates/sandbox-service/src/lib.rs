@@ -197,8 +197,7 @@ impl SandboxService {
         prepare_explorer_workspace(&profile_root, &self.policy.apps)?;
         write_explorer_policy_reg(&profile_root)?;
         apply_profile_acl(&profile_root, &user_sid)?;
-        sandbox_desktop::ensure_desktop(&desktop_name)?;
-        sandbox_desktop::grant_desktop_access(&desktop_name, &user_sid)?;
+        prepare_desktop_access(&desktop_name, &user_sid)?;
         self.network
             .apply_policy(&id, &self.policy.network, &self.policy.apps)?;
         let job = JobHandle::create(&id.0)?;
@@ -614,6 +613,17 @@ fn dedicated_user_requested(value: &str) -> bool {
         || value.eq_ignore_ascii_case("sandbox-plus")
         || value.eq_ignore_ascii_case("SandboxPlusUser")
         || value.eq_ignore_ascii_case("SandboxPlusUsr")
+}
+
+#[cfg(not(test))]
+fn prepare_desktop_access(desktop_name: &str, user_sid: &str) -> Result<()> {
+    sandbox_desktop::ensure_desktop(desktop_name)?;
+    sandbox_desktop::grant_desktop_access(desktop_name, user_sid)
+}
+
+#[cfg(test)]
+fn prepare_desktop_access(_desktop_name: &str, _user_sid: &str) -> Result<()> {
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
