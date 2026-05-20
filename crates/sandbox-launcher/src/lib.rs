@@ -106,8 +106,9 @@ mod platform {
         DESKTOP_SWITCHDESKTOP, DESKTOP_WRITEOBJECTS, HDESK,
     };
     use windows_sys::Win32::System::Threading::{
-        CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, ResumeThread, WaitForInputIdle,
-        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
+        CreateProcessAsUserW, CreateProcessWithTokenW, GetCurrentProcess, OpenProcessToken,
+        ResumeThread, WaitForInputIdle, CREATE_BREAKAWAY_FROM_JOB, CREATE_SUSPENDED,
+        CREATE_UNICODE_ENVIRONMENT, LOGON_WITH_PROFILE, PROCESS_INFORMATION, STARTUPINFOW,
     };
     use windows_sys::Win32::UI::Shell::{LoadUserProfileW, PROFILEINFOW};
 
@@ -163,7 +164,7 @@ mod platform {
         let profile = LoadedUserProfile::load(logon.token, &credentials.username)?;
         let command_line = build_command_line(&request);
         let environment = EnvironmentBlock::for_token(logon.token, &request)?;
-        let child = ChildProcess::create_as_user_suspended(
+        let child = ChildProcess::create_with_token_suspended(
             logon.token,
             &command_line,
             &request.desktop_name,
@@ -355,7 +356,7 @@ mod platform {
             })
         }
 
-        fn create_as_user_suspended(
+        fn create_with_token_suspended(
             token: HANDLE,
             command_line: &str,
             desktop_name: &str,
@@ -374,14 +375,12 @@ mod platform {
             let mut process_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
             let ok = unsafe {
-                CreateProcessAsUserW(
+                CreateProcessWithTokenW(
                     token,
+                    LOGON_WITH_PROFILE,
                     null(),
                     command_line.as_mut_ptr(),
-                    null(),
-                    null(),
-                    0,
-                    CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
+                    CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | CREATE_BREAKAWAY_FROM_JOB,
                     environment,
                     if working_directory_wide.is_empty() {
                         null()
@@ -393,7 +392,7 @@ mod platform {
                 )
             };
             if ok == 0 {
-                return Err(last_error("CreateProcessAsUserW(dedicated)"));
+                return Err(last_error("CreateProcessWithTokenW(dedicated)"));
             }
 
             Ok(Self {
