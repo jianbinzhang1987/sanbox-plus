@@ -20,6 +20,10 @@ pub enum IpcRequest {
         sandbox_id: SandboxId,
     },
     LaunchApp(LaunchAppRequest),
+    LaunchSystemProcess(LaunchAppRequest),
+    RecoverWorkspace {
+        sandbox_id: SandboxId,
+    },
     RecordProcess {
         sandbox_id: SandboxId,
         process: ProcessInfo,
@@ -31,6 +35,15 @@ pub enum IpcRequest {
         sandbox_id: SandboxId,
     },
     ReturnToHost {
+        sandbox_id: SandboxId,
+    },
+    EnterSession {
+        sandbox_id: SandboxId,
+    },
+    ImportFiles {
+        sandbox_id: SandboxId,
+    },
+    ExportFiles {
         sandbox_id: SandboxId,
     },
     ExportDiagnosticBundle {

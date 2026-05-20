@@ -15,6 +15,13 @@
       "exe_path": "notepad.exe",
       "hash_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "network_profile": "IntranetOnly"
+    },
+    {
+      "id": "cmd",
+      "name": "Command Prompt",
+      "exe_path": "cmd.exe",
+      "hash_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "network_profile": "IntranetOnly"
     }
   ],
   "network": {

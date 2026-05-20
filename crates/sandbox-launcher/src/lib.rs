@@ -7,6 +7,8 @@ pub struct LauncherOptions {
     pub dry_run: bool,
     pub credentials: Option<LaunchCredentials>,
     pub job_handle: Option<isize>,
+    pub import_profile_registry: bool,
+    pub apply_profile_environment: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,6 +16,7 @@ pub struct LaunchCredentials {
     pub username: String,
     pub domain: Option<String>,
     pub password: String,
+    pub user_sid: String,
 }
 
 impl Default for LauncherOptions {
@@ -22,6 +25,8 @@ impl Default for LauncherOptions {
             dry_run: true,
             credentials: None,
             job_handle: None,
+            import_profile_registry: false,
+            apply_profile_environment: true,
         }
     }
 }
@@ -33,7 +38,7 @@ pub fn launch_app(
     validate_launch_request(&request)?;
 
     if !options.dry_run {
-        return platform::launch_restricted(request, options.credentials, options.job_handle);
+        return platform::launch_restricted(request, options);
     }
 
     Ok(LaunchAppResponse {
@@ -113,7 +118,7 @@ mod platform {
     };
     use windows_sys::Win32::UI::Shell::{LoadUserProfileW, PROFILEINFOW};
 
-    use crate::LaunchCredentials;
+    use crate::{LaunchCredentials, LauncherOptions};
 
     const DESKTOP_ACCESS: u32 =
         DESKTOP_CREATEWINDOW | DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP | DESKTOP_WRITEOBJECTS;
@@ -121,18 +126,33 @@ mod platform {
 
     pub fn launch_restricted(
         request: LaunchAppRequest,
-        credentials: Option<LaunchCredentials>,
-        job_handle: Option<isize>,
+        options: LauncherOptions,
     ) -> Result<LaunchAppResponse> {
-        if let Some(credentials) = credentials {
-            return launch_with_credentials(request, credentials, job_handle);
+        launcher_log(&format!(
+            "launch app_id={} exe={} desktop={} credentials={} import_reg={} profile_env={} job={}",
+            request.app_id,
+            request.executable.display(),
+            request.desktop_name,
+            options.credentials.is_some(),
+            options.import_profile_registry,
+            options.apply_profile_environment,
+            options.job_handle.is_some()
+        ));
+        if let Some(credentials) = options.credentials {
+            return launch_with_credentials(
+                request,
+                credentials,
+                options.job_handle,
+                options.import_profile_registry,
+                options.apply_profile_environment,
+            );
         }
 
         let current_token = ProcessToken::open_current()?;
         let restricted_token = current_token.create_restricted()?;
         let _desktop_handle = DesktopHandle::open_or_create(&request.desktop_name)?;
         let command_line = build_command_line(&request);
-        let environment = build_environment_block(&request);
+        let environment = build_environment_block(&request, options.apply_profile_environment);
         let child = ChildProcess::create_as_user(
             restricted_token.raw,
             &command_line,
@@ -140,7 +160,11 @@ mod platform {
             request.working_directory.as_ref(),
             environment.as_ptr() as *mut _,
         )?;
-        let job_assigned = child.assign_to_job(job_handle)?;
+        launcher_log(&format!(
+            "launch current-token CreateProcessAsUserW pid={}",
+            child.process_id
+        ));
+        let job_assigned = child.assign_to_job(options.job_handle)?;
 
         Ok(LaunchAppResponse {
             process: ProcessInfo {
@@ -159,21 +183,75 @@ mod platform {
         request: LaunchAppRequest,
         credentials: LaunchCredentials,
         job_handle: Option<isize>,
+        import_profile_registry: bool,
+        apply_profile_environment: bool,
     ) -> Result<LaunchAppResponse> {
-        let _desktop_handle = DesktopHandle::open_or_create(&request.desktop_name)?;
         let logon = LogonSession::interactive(&credentials)?;
+        set_token_session_to_interactive(logon.token)?;
         let profile = LoadedUserProfile::load(logon.token, &credentials.username)?;
+        if import_profile_registry {
+            import_profile_registry_templates(&request, &credentials.user_sid)?;
+        }
         let command_line = build_command_line(&request);
-        let environment = EnvironmentBlock::for_token(logon.token, &request)?;
-        let child = ChildProcess::create_with_token_suspended(
+        let environment =
+            EnvironmentBlock::for_token(logon.token, &request, apply_profile_environment)?;
+        let child = match ChildProcess::create_as_user(
             logon.token,
             &command_line,
             &request.desktop_name,
             request.working_directory.as_ref(),
             environment.as_ptr(),
-        )?;
+        ) {
+            Ok(child) => {
+                launcher_log(&format!(
+                    "launch credentials CreateProcessAsUserW pid={} app_id={}",
+                    child.process_id, request.app_id
+                ));
+                child
+            }
+            Err(as_user_error) => {
+                launcher_log(&format!(
+                    "launch credentials CreateProcessAsUserW failed app_id={}: {}",
+                    request.app_id, as_user_error
+                ));
+                let child = ChildProcess::create_with_token_suspended(
+                    logon.token,
+                    &command_line,
+                    &request.desktop_name,
+                    request.working_directory.as_ref(),
+                    environment.as_ptr(),
+                )?;
+                child.resume()?;
+                launcher_log(&format!(
+                    "launch credentials CreateProcessWithTokenW fallback pid={} app_id={}",
+                    child.process_id, request.app_id
+                ));
+                eprintln!(
+                    "CreateProcessAsUserW failed; fell back to CreateProcessWithTokenW: {as_user_error}"
+                );
+                child
+            }
+        };
         let job_assigned = child.assign_to_job(job_handle)?;
-        child.resume()?;
+        // Wait briefly for the child process to fully initialize and attach to
+        // the interactive desktop. WaitForInputIdle only waits for the message
+        // queue but not full desktop attachment; if the caller (manager) exits
+        // and closes the last desktop handle before the child has a stable
+        // desktop reference, the desktop is destroyed and the child crashes.
+        {
+            use windows_sys::Win32::System::Threading::{
+                GetExitCodeProcess, WaitForSingleObject,
+            };
+            let wait_result = unsafe { WaitForSingleObject(child.process, 1000) };
+            if wait_result == 0 {
+                let mut exit_code: u32 = 0;
+                unsafe { GetExitCodeProcess(child.process, &mut exit_code) };
+                launcher_log(&format!(
+                    "launch: pid={} exited during init with code 0x{:08X}",
+                    child.process_id, exit_code
+                ));
+            }
+        }
         profile.keep_loaded();
 
         Ok(LaunchAppResponse {
@@ -446,47 +524,114 @@ mod platform {
         }
     }
 
+    fn set_token_session_to_interactive(token: HANDLE) -> Result<()> {
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, SetTokenInformation, TokenSessionId,
+        };
+        use windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
+
+        let target_session = unsafe { WTSGetActiveConsoleSessionId() };
+        if target_session == 0xFFFF_FFFF {
+            return Ok(());
+        }
+
+        let mut current_session: u32 = 0;
+        let mut returned: u32 = 0;
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TokenSessionId,
+                &mut current_session as *mut u32 as *mut _,
+                size_of::<u32>() as u32,
+                &mut returned,
+            )
+        };
+        if ok != 0 && current_session == target_session {
+            return Ok(());
+        }
+
+        let mut session_id = target_session;
+        let ok = unsafe {
+            SetTokenInformation(
+                token,
+                TokenSessionId,
+                &mut session_id as *mut u32 as *mut _,
+                size_of::<u32>() as u32,
+            )
+        };
+        if ok == 0 {
+            let code = unsafe { GetLastError() };
+            if code == 1314 {
+                // ERROR_PRIVILEGE_NOT_HELD: running in foreground mode without
+                // SE_TCB_NAME; token is already in the interactive session.
+                return Ok(());
+            }
+            return Err(last_error("SetTokenInformation(TokenSessionId)"));
+        }
+        Ok(())
+    }
+
     fn build_command_line(request: &LaunchAppRequest) -> String {
         let mut parts = vec![quote_arg(&request.executable.display().to_string())];
         parts.extend(request.arguments.iter().map(|arg| quote_arg(arg)));
         parts.join(" ")
     }
 
-    fn build_environment_block(request: &LaunchAppRequest) -> Vec<u16> {
+    fn import_profile_registry_templates(request: &LaunchAppRequest, user_sid: &str) -> Result<()> {
+        for filename in ["sandbox-srp-policies.reg", "sandbox-explorer-policies.reg"] {
+            let path = request.profile_root.join(filename);
+            if !path.exists() {
+                continue;
+            }
+            let content = std::fs::read_to_string(&path).map_err(|error| {
+                SandboxError::System(format!(
+                    "failed to read registry template '{}': {error}",
+                    path.display()
+                ))
+            })?;
+            let rewritten =
+                content.replace("HKEY_CURRENT_USER", &format!("HKEY_USERS\\{user_sid}"));
+            let import_path = request
+                .profile_root
+                .join("Temp")
+                .join(format!("hku-{filename}"));
+            std::fs::write(&import_path, rewritten).map_err(|error| {
+                SandboxError::System(format!(
+                    "failed to write rewritten registry template '{}': {error}",
+                    import_path.display()
+                ))
+            })?;
+
+            let output = std::process::Command::new(r"C:\Windows\System32\reg.exe")
+                .arg("import")
+                .arg(&import_path)
+                .output()
+                .map_err(|error| {
+                    SandboxError::System(format!("failed to run reg import: {error}"))
+                })?;
+            let _ = std::fs::remove_file(&import_path);
+            if !output.status.success() {
+                return Err(SandboxError::System(format!(
+                    "reg import '{}' into HKEY_USERS\\{} failed with status {}: {}{}",
+                    path.display(),
+                    user_sid,
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn build_environment_block(
+        request: &LaunchAppRequest,
+        apply_profile_environment: bool,
+    ) -> Vec<u16> {
         let mut values: Vec<(String, String)> = std::env::vars().collect();
-        upsert_env(
-            &mut values,
-            "USERPROFILE",
-            &request.profile_root.display().to_string(),
-        );
-        upsert_env(
-            &mut values,
-            "APPDATA",
-            &request
-                .profile_root
-                .join("AppData\\Roaming")
-                .display()
-                .to_string(),
-        );
-        upsert_env(
-            &mut values,
-            "LOCALAPPDATA",
-            &request
-                .profile_root
-                .join("AppData\\Local")
-                .display()
-                .to_string(),
-        );
-        upsert_env(
-            &mut values,
-            "TEMP",
-            &request.profile_root.join("Temp").display().to_string(),
-        );
-        upsert_env(
-            &mut values,
-            "TMP",
-            &request.profile_root.join("Temp").display().to_string(),
-        );
+        if apply_profile_environment {
+            apply_profile_environment_overrides(&mut values, request);
+        }
         for item in &request.environment_overrides {
             upsert_env(&mut values, &item.name, &item.value);
         }
@@ -580,7 +725,11 @@ mod platform {
     }
 
     impl EnvironmentBlock {
-        fn for_token(token: HANDLE, request: &LaunchAppRequest) -> Result<Self> {
+        fn for_token(
+            token: HANDLE,
+            request: &LaunchAppRequest,
+            apply_profile_environment: bool,
+        ) -> Result<Self> {
             let mut raw = null_mut();
             let ok = unsafe { CreateEnvironmentBlock(&mut raw, token, 0) };
             if ok == 0 {
@@ -592,7 +741,9 @@ mod platform {
                 DestroyEnvironmentBlock(raw);
             }
 
-            apply_profile_environment_overrides(&mut values, request);
+            if apply_profile_environment {
+                apply_profile_environment_overrides(&mut values, request);
+            }
             values.sort_by(|left, right| left.0.to_uppercase().cmp(&right.0.to_uppercase()));
 
             let mut block = Vec::new();
@@ -752,6 +903,29 @@ mod platform {
         }
     }
 
+    fn launcher_log(message: &str) {
+        let path = std::path::Path::new(r"C:\ProgramData\SandboxPlus\Logs\sandbox-launcher.log");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let line = format!("{} {message}\r\n", unix_timestamp());
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut file| {
+                use std::io::Write;
+                file.write_all(line.as_bytes())
+            });
+    }
+
+    fn unix_timestamp() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0)
+    }
+
     fn wide_null(value: &str) -> Vec<u16> {
         value.encode_utf16().chain(std::iter::once(0)).collect()
     }
@@ -764,13 +938,12 @@ mod platform {
 
 #[cfg(not(windows))]
 mod platform {
-    use crate::LaunchCredentials;
+    use crate::LauncherOptions;
     use sandbox_common::{LaunchAppRequest, LaunchAppResponse, Result, SandboxError};
 
     pub fn launch_restricted(
         _request: LaunchAppRequest,
-        _credentials: Option<LaunchCredentials>,
-        _job_handle: Option<isize>,
+        _options: LauncherOptions,
     ) -> Result<LaunchAppResponse> {
         Err(SandboxError::UnsupportedPlatform(
             "restricted token launch is only available on Windows".to_string(),
@@ -818,6 +991,8 @@ mod tests {
                 dry_run: false,
                 credentials: None,
                 job_handle: None,
+                import_profile_registry: false,
+                apply_profile_environment: true,
             },
         )
         .expect("real restricted launch should start");

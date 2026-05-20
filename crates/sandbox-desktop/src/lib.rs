@@ -30,6 +30,12 @@ pub struct DesktopProcess {
     pub process_id: u32,
 }
 
+/// Opaque guard that keeps a desktop handle open. Drop it to release.
+pub struct DesktopGuard {
+    #[cfg(windows)]
+    _handle: platform::OwnedDesktopHandle,
+}
+
 #[cfg(windows)]
 mod platform {
     use super::{DesktopProcess, DesktopReady, DesktopSource, DesktopSwitchResult};
@@ -46,9 +52,9 @@ mod platform {
         PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
     };
     use windows_sys::Win32::System::StationsAndDesktops::{
-        CloseDesktop, CreateDesktopW, GetProcessWindowStation, OpenDesktopW, SwitchDesktop,
-        DESKTOP_CREATEWINDOW, DESKTOP_READOBJECTS, DESKTOP_SWITCHDESKTOP, DESKTOP_WRITEOBJECTS,
-        HDESK,
+        CloseDesktop, CloseWindowStation, CreateDesktopW, GetProcessWindowStation, OpenDesktopW,
+        OpenWindowStationW, SetProcessWindowStation, SwitchDesktop, DESKTOP_CREATEWINDOW,
+        DESKTOP_READOBJECTS, DESKTOP_SWITCHDESKTOP, DESKTOP_WRITEOBJECTS, HDESK,
     };
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, WaitForInputIdle, PROCESS_INFORMATION, STARTUPINFOW,
@@ -59,6 +65,8 @@ mod platform {
     const READ_CONTROL: u32 = 0x0002_0000;
     const WRITE_DAC: u32 = 0x0004_0000;
     const DESKTOP_SECURITY_ACCESS: u32 = DESKTOP_ACCESS | READ_CONTROL | WRITE_DAC;
+    // WINSTA_ENUMDESKTOPS(1) | WINSTA_READATTRIBUTES(2) | WINSTA_CREATEDESKTOP(8)
+    const WINSTA_GRANT_ACCESS: u32 = READ_CONTROL | WRITE_DAC | 0x000B;
 
     pub fn ensure_desktop(name: &str) -> Result<DesktopReady> {
         validate_desktop_name(name)?;
@@ -70,6 +78,29 @@ mod platform {
         })
     }
 
+    pub fn hold_desktop(name: &str) -> Result<super::DesktopGuard> {
+        validate_desktop_name(name)?;
+        let desktop = DesktopHandle::open_or_create(name)?;
+        Ok(super::DesktopGuard {
+            _handle: OwnedDesktopHandle(desktop),
+        })
+    }
+
+    pub struct OwnedDesktopHandle(DesktopHandle);
+
+    /// Open the sandbox desktop on the interactive WinSta0 and return a guard
+    /// that keeps the handle alive. Use from a Session 0 service to prevent
+    /// the desktop from being destroyed when the manager process exits.
+    pub fn hold_desktop_on_interactive_winsta(name: &str) -> Result<super::DesktopGuard> {
+        validate_desktop_name(name)?;
+        let winsta0 = WindowStationHandle::open_winsta0()?;
+        let _guard = winsta0.make_process_current()?;
+        let desktop = DesktopHandle::open_or_create(name)?;
+        Ok(super::DesktopGuard {
+            _handle: OwnedDesktopHandle(desktop),
+        })
+    }
+
     pub fn grant_desktop_access(name: &str, user_sid: &str) -> Result<()> {
         validate_desktop_name(name)?;
         if user_sid.trim().is_empty() {
@@ -78,17 +109,25 @@ mod platform {
             ));
         }
 
-        let window_station = unsafe { GetProcessWindowStation() };
-        if window_station.is_null() {
-            return Err(last_error("GetProcessWindowStation"));
-        }
+        // Open the interactive window station explicitly. When called from a
+        // Windows Service (Session 0), GetProcessWindowStation() returns the
+        // service's own window station (e.g. Service-0x0-3e7$), NOT WinSta0.
+        // Explorer and Agent need WinSta0 access to initialize their DLLs;
+        // without it they fail with STATUS_DLL_INIT_FAILED (0xC0000142).
+        let winsta0 = WindowStationHandle::open_winsta0()?;
         apply_user_object_dacl(
-            window_station as HANDLE,
+            winsta0.raw as HANDLE,
             &WindowStationSecurity::sddl(user_sid),
             "SetUserObjectSecurity(WinSta0)",
         )?;
 
-        let desktop = DesktopHandle::open_or_create(name)?;
+        // Temporarily associate this process with WinSta0 so that
+        // OpenDesktopW / CreateDesktopW targets the interactive desktop
+        // rather than a desktop on the service's window station.
+        let _guard = winsta0.make_process_current()?;
+
+        let desktop =
+            DesktopHandle::open_or_create_with_access(name, DESKTOP_SECURITY_ACCESS)?;
         match apply_user_object_dacl(
             desktop.raw as HANDLE,
             &DesktopSecurity::sddl(user_sid),
@@ -250,6 +289,59 @@ mod platform {
         }
     }
 
+    struct WindowStationHandle {
+        raw: HANDLE,
+    }
+
+    impl WindowStationHandle {
+        fn open_winsta0() -> Result<Self> {
+            let name = wide_null("WinSta0");
+            let raw =
+                unsafe { OpenWindowStationW(name.as_ptr(), 0, WINSTA_GRANT_ACCESS) };
+            if raw.is_null() {
+                return Err(last_error("OpenWindowStationW(WinSta0)"));
+            }
+            Ok(Self {
+                raw: raw as HANDLE,
+            })
+        }
+
+        fn make_process_current(&self) -> Result<WindowStationGuard> {
+            let previous = unsafe { GetProcessWindowStation() };
+            let ok = unsafe { SetProcessWindowStation(self.raw as _) };
+            if ok == 0 {
+                return Err(last_error("SetProcessWindowStation(WinSta0)"));
+            }
+            Ok(WindowStationGuard {
+                previous: previous as HANDLE,
+            })
+        }
+    }
+
+    impl Drop for WindowStationHandle {
+        fn drop(&mut self) {
+            if !self.raw.is_null() {
+                unsafe {
+                    CloseWindowStation(self.raw as _);
+                }
+            }
+        }
+    }
+
+    struct WindowStationGuard {
+        previous: HANDLE,
+    }
+
+    impl Drop for WindowStationGuard {
+        fn drop(&mut self) {
+            if !self.previous.is_null() {
+                unsafe {
+                    SetProcessWindowStation(self.previous as _);
+                }
+            }
+        }
+    }
+
     fn validate_desktop_name(name: &str) -> Result<()> {
         if name.trim().is_empty() {
             return Err(SandboxError::Configuration(
@@ -382,6 +474,18 @@ mod platform {
         ))
     }
 
+    pub fn hold_desktop(_name: &str) -> Result<super::DesktopGuard> {
+        Err(SandboxError::UnsupportedPlatform(
+            "Windows Desktop APIs are only available on Windows".to_string(),
+        ))
+    }
+
+    pub fn hold_desktop_on_interactive_winsta(_name: &str) -> Result<super::DesktopGuard> {
+        Err(SandboxError::UnsupportedPlatform(
+            "Windows Desktop APIs are only available on Windows".to_string(),
+        ))
+    }
+
     pub fn grant_desktop_access(_name: &str, _user_sid: &str) -> Result<()> {
         Err(SandboxError::UnsupportedPlatform(
             "Windows Desktop ACL APIs are only available on Windows".to_string(),
@@ -408,6 +512,6 @@ mod platform {
 }
 
 pub use platform::{
-    ensure_desktop, grant_desktop_access, spawn_on_desktop, switch_to_default_desktop,
-    switch_to_desktop,
+    ensure_desktop, grant_desktop_access, hold_desktop, hold_desktop_on_interactive_winsta,
+    spawn_on_desktop, switch_to_default_desktop, switch_to_desktop,
 };

@@ -9,10 +9,12 @@ version.workspace = true
 sandbox-common = { path = "../sandbox-common" }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_System_Environment",
     "Win32_System_JobObjects",
+    "Win32_System_RemoteDesktop",
     "Win32_System_StationsAndDesktops",
     "Win32_System_Threading",
     "Win32_UI_Shell",

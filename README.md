@@ -55,12 +55,12 @@ graph TD
 | **`crates/sandbox-desktop`** | 封装 Windows Desktop (`WinSta0\Sandbox-*`) 的创建、关闭、切换及定向启动进程的底层 API。 | 已实现核心 Desktop 句柄操作库 |
 | **`crates/sandbox-launcher`** | 短生命周期 Helper，负责以 Restricted Token、Integrity Level 及定制环境变量启动沙箱应用。 | 已接入 Token 裁剪与 Integrity 设定边界 |
 | **`crates/sandbox-ipc`** | 定义 Service 与 Controller/Shell 之间的 Named Pipe 通信协议与 JSON 序列化消息。 | 已完成通用请求/响应协议枚举 |
-| **`crates/sandbox-shell`** | 运行在沙箱桌面环境中的工作区壳，负责展示状态栏、启动白名单应用及任务栏交互。 | 已完成第一版 Win32 原生 Shell 占位实现 |
+| **`crates/sandbox-shell`** | 运行在沙箱桌面环境中的工作区壳，负责展示状态栏、启动白名单应用及任务栏交互。 | Explorer Phase 0 失败后恢复为产品主线；当前为 Win32 占位实现 |
 | **`crates/sandbox-policy`** | 安全策略管理与白名单规则校验库。 | 已实现 JSON 策略加载与应用过滤 |
 | **`crates/sandbox-audit`** | 提供统一的 JSONL 格式审计日志接收器，审计沙箱的创建、切换与敏感操作。 | 已完成基础 Audit Sink |
 | **`crates/sandbox-net`** | 基于 WFP (Windows Filtering Platform) 的网络隔离模块。 | 已定义 `NetworkEnforcer` 隔离边界 |
 | **`crates/sandbox-common`** | 基础类型、系统错误处理（`SandboxError`）与公用工具函数。 | 基础模块 |
-| **`crates/sandbox-shell-winui`** | 预留的 WinUI 3 现代化沙箱 Shell 工程（基于 C# / .NET 8.0）。 | 待进一步迭代接入 |
+| **`crates/sandbox-shell-winui`** | 预留的 WinUI 3 现代化沙箱 Shell 工程（基于 C# / .NET 8.0）。 | 暂不作为主线；方案 B 优先评估 Rust + WebView2/MSHTML |
 | **`docs/`** | 包含项目技术方案、PoC 验证报告及详细设计规范。 | 完善中 |
 
 ---
@@ -70,7 +70,7 @@ graph TD
 ### 准备环境
 由于 Sandbox+ 涉及 Windows 底层 API（Desktop、Token、Job Object 等），请在 **Windows 操作系统**下开发与运行。
 1. 安装 [Rust 编译链](https://rustup.rs/)（使用 `x86_64-pc-windows-msvc`）。
-2. （可选，用于 WinUI 3 Shell）安装 [.NET 8.0 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)。
+2. （可选，用于 WinUI 3 Shell 验证）安装 [.NET 8.0 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)。
 
 ### 编译项目
 在项目根目录下，执行 Cargo 命令编译所有 Rust crate：
@@ -138,7 +138,7 @@ powershell -File scripts/smoke-session.ps1
 ## 开发路线图 (Roadmap)
 
 - [x] **M1: 核心产品化骨架** (Crate 拆分、Named Pipe IPC 通信、Session 状态机、Job Object 第一版、JSONL 审计落地)
-- [ ] **M2: WinUI 3 Sandbox Shell 迭代** (提供原生 Fluent Design 的顶部/底部任务栏、白名单启动面板、中英文策略提示)
+- [ ] **M2: 方案 B Sandbox Shell 迭代** (Rust + WebView2 优先，MSHTML 或当前 Win32 Shell 作为兼容降级；提供状态栏、白名单启动面板、中英文策略提示)
 - [ ] **M3: 受控启动链路加强** (全量限制 Token、应用低特权 Profile 及临时 Temp 环境覆盖)
 - [ ] **M4: 进阶隔离 (WFP & ACL & Broker)** (真实 WFP 网络策略规则下发、宿主敏感目录默认 ACL 阻断、剪贴板与文件导入导出 Broker 落地)
 - [ ] **M5: 容灾、诊断与多用户兼容** (Shell 崩溃自拉起、异常清理、锁屏/UAC/RDP 多显示器适配、诊断包一键收集)

@@ -3,7 +3,8 @@ use sandbox_common::{
     ProcessState, SandboxError, SandboxInstance, SandboxState, UpdateSessionStateRequest,
 };
 use sandbox_desktop::{
-    ensure_desktop, spawn_on_desktop, switch_to_default_desktop, switch_to_desktop,
+    ensure_desktop, grant_desktop_access, hold_desktop, spawn_on_desktop,
+    switch_to_default_desktop, switch_to_desktop,
 };
 use sandbox_ipc::{send_request, IpcRequest, IpcResponse, SERVICE_PIPE_NAME};
 
@@ -25,6 +26,7 @@ fn main() {
             let app_id = args.next().unwrap_or_else(|| "cmd".to_string());
             launch_policy_app(&app_id)
         }
+        "recover-workspace" => recover_workspace(),
         "ensure-desktop" => {
             let desktop_name = args.next();
             ensure_controller_desktop(desktop_name.as_deref())
@@ -63,6 +65,7 @@ fn print_usage() {
   sandbox-manager list-processes
   sandbox-manager list-apps
   sandbox-manager launch-app <app-id>
+  sandbox-manager recover-workspace
   sandbox-manager ensure-desktop [desktop-name]
   sandbox-manager enter [desktop-name]
   sandbox-manager return
@@ -105,7 +108,10 @@ fn create_session(user_sid: String) -> sandbox_common::Result<()> {
     println!("  profile: {}", response.instance.profile_root.display());
     println!("  state: {:?}", response.instance.state);
     ensure_desktop(&response.instance.desktop_name)?;
+    let _desktop_guard = hold_desktop(&response.instance.desktop_name)?;
+    grant_desktop_access(&response.instance.desktop_name, &response.instance.user_sid)?;
     start_workspace(&response.instance)?;
+    drop(_desktop_guard);
     println!("  workspace: explorer + agent started");
 
     Ok(())
@@ -219,6 +225,39 @@ fn launch_policy_app(app_id: &str) -> sandbox_common::Result<()> {
     Ok(())
 }
 
+fn recover_workspace() -> sandbox_common::Result<()> {
+    let instance = active_instance()?;
+    let processes = recover_workspace_for_instance(&instance)?;
+
+    if processes.is_empty() {
+        println!("workspace critical processes are already running");
+    } else {
+        for process in processes {
+            println!(
+                "recovered pid={} app={:?} exe={} state={:?}",
+                process.process_id,
+                process.app_id,
+                process.executable.display(),
+                process.state
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn recover_workspace_for_instance(
+    instance: &SandboxInstance,
+) -> sandbox_common::Result<Vec<ProcessInfo>> {
+    let response = request_service(IpcRequest::RecoverWorkspace {
+        sandbox_id: instance.id.clone(),
+    })?;
+    let IpcResponse::Processes(processes) = response else {
+        return Err(unexpected_response(response));
+    };
+    Ok(processes)
+}
+
 fn request_service(request: IpcRequest) -> sandbox_common::Result<IpcResponse> {
     send_request(SERVICE_PIPE_NAME, &request)
 }
@@ -269,6 +308,9 @@ fn enter_desktop(desktop_name: Option<&str>) -> sandbox_common::Result<()> {
                 .map(|instance| instance.desktop_name.clone())
         })
         .ok_or_else(|| SandboxError::System("active desktop resolution failed".to_string()))?;
+    if let Some(instance) = instance.as_ref() {
+        let _ = recover_workspace_for_instance(instance)?;
+    }
     let ready = ensure_desktop(&desktop_name)?;
     let result = switch_to_desktop(&desktop_name)?;
 
@@ -336,23 +378,27 @@ fn start_workspace(instance: &SandboxInstance) -> sandbox_common::Result<()> {
 
 fn start_explorer(instance: &SandboxInstance) -> sandbox_common::Result<()> {
     let explorer = std::path::PathBuf::from(r"C:\Windows\explorer.exe");
-    let command = format!("{} /separate", quote_arg(&explorer.display().to_string()));
-    let process = spawn_on_desktop(&command, &instance.desktop_name)?;
-    let response = request_service(IpcRequest::RecordProcess {
+    let response = request_service(IpcRequest::LaunchSystemProcess(LaunchAppRequest {
         sandbox_id: instance.id.clone(),
-        process: ProcessInfo {
-            process_id: process.process_id,
-            app_id: Some("sandbox-explorer".to_string()),
-            executable: explorer,
-            state: ProcessState::Running,
-        },
-    })?;
-    if !matches!(response, IpcResponse::Ok) {
+        app_id: "sandbox-explorer".to_string(),
+        executable: explorer,
+        arguments: vec!["/separate".to_string()],
+        working_directory: None,
+        desktop_name: instance.desktop_name.clone(),
+        profile_root: instance.profile_root.clone(),
+        environment_overrides: Vec::new(),
+        policy_version: instance.policy_version.clone(),
+    }))?;
+    let IpcResponse::LaunchApp(response) = response else {
         return Err(unexpected_response(response));
-    }
+    };
     println!(
-        "started explorer process {} on WinSta0\\{}",
-        process.process_id, instance.desktop_name
+        "started explorer process {} on WinSta0\\{} restricted_token={} profile={} job={}",
+        response.process.process_id,
+        instance.desktop_name,
+        response.restricted_token_applied,
+        response.profile_applied,
+        response.job_assigned
     );
     Ok(())
 }
@@ -366,28 +412,32 @@ fn start_agent(instance: &SandboxInstance) -> sandbox_common::Result<()> {
         )));
     }
 
-    let command = format!(
-        "{} --sandbox-id {} --desktop-name {}",
-        quote_arg(&agent.display().to_string()),
-        quote_arg(&instance.id.0),
-        quote_arg(&instance.desktop_name)
-    );
-    let process = spawn_on_desktop(&command, &instance.desktop_name)?;
-    let response = request_service(IpcRequest::RecordProcess {
+    let response = request_service(IpcRequest::LaunchSystemProcess(LaunchAppRequest {
         sandbox_id: instance.id.clone(),
-        process: ProcessInfo {
-            process_id: process.process_id,
-            app_id: Some("sandbox-agent".to_string()),
-            executable: agent,
-            state: ProcessState::Running,
-        },
-    })?;
-    if !matches!(response, IpcResponse::Ok) {
+        app_id: "sandbox-agent".to_string(),
+        executable: agent,
+        arguments: vec![
+            "--sandbox-id".to_string(),
+            instance.id.0.clone(),
+            "--desktop-name".to_string(),
+            instance.desktop_name.clone(),
+        ],
+        working_directory: None,
+        desktop_name: instance.desktop_name.clone(),
+        profile_root: instance.profile_root.clone(),
+        environment_overrides: Vec::new(),
+        policy_version: instance.policy_version.clone(),
+    }))?;
+    let IpcResponse::LaunchApp(response) = response else {
         return Err(unexpected_response(response));
-    }
+    };
     println!(
-        "started agent process {} on WinSta0\\{}",
-        process.process_id, instance.desktop_name
+        "started agent process {} on WinSta0\\{} restricted_token={} profile={} job={}",
+        response.process.process_id,
+        instance.desktop_name,
+        response.restricted_token_applied,
+        response.profile_applied,
+        response.job_assigned
     );
     Ok(())
 }
@@ -485,7 +535,14 @@ mod controller {
     use sandbox_common::{Result, SandboxError};
     use std::mem::size_of;
     use std::ptr::{null, null_mut};
-    use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM};
+    use windows_sys::Win32::Foundation::{
+        GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM,
+    };
+    use windows_sys::Win32::Graphics::Gdi::{
+        BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, FrameRect,
+        InvalidateRect, SetBkMode, SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, PAINTSTRUCT,
+        TRANSPARENT,
+    };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL,
@@ -496,17 +553,27 @@ mod controller {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
         DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, PostQuitMessage, RegisterClassW,
-        SetForegroundWindow, TrackPopupMenu, TranslateMessage, CW_USEDEFAULT, HMENU,
-        IDI_APPLICATION, MF_STRING, MSG, TPM_RETURNCMD, WM_COMMAND, WM_DESTROY, WM_HOTKEY,
-        WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+        SetForegroundWindow, SetLayeredWindowAttributes, TrackPopupMenu, TranslateMessage, HMENU,
+        IDI_APPLICATION, LWA_ALPHA, MF_SEPARATOR, MF_STRING, MSG, SM_CXSCREEN, SM_CYSCREEN,
+        TPM_RETURNCMD, WM_COMMAND, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_NCHITTEST, WM_PAINT,
+        WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        WS_POPUP, WS_VISIBLE,
     };
 
+    const HTCAPTION: LRESULT = 2;
     const HOTKEY_ID: i32 = 1001;
     const TRAY_ID: u32 = 2001;
     const WM_TRAYICON: u32 = 0x8001;
     const MENU_ENTER: usize = 3001;
     const MENU_RETURN: usize = 3002;
     const MENU_EXIT: usize = 3003;
+    const BUTTON_WIDTH: i32 = 128;
+    const BUTTON_HEIGHT: i32 = 48;
+    const BUTTON_ALPHA: u8 = 210;
+    const COLOR_READY: u32 = 0x00006b2e;
+    const COLOR_READY_BORDER: u32 = 0x00005522;
+    const COLOR_IDLE: u32 = 0x00606060;
+    const COLOR_IDLE_BORDER: u32 = 0x00484848;
 
     pub fn run() -> Result<()> {
         let window = ControllerWindow::create()?;
@@ -538,16 +605,24 @@ mod controller {
                 RegisterClassW(&window_class);
             }
 
+            let screen_w = unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(SM_CXSCREEN)
+            };
+            let screen_h = unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(SM_CYSCREEN)
+            };
+            let x = screen_w - BUTTON_WIDTH - 32;
+            let y = screen_h / 2 + 60;
             let hwnd = unsafe {
                 CreateWindowExW(
-                    0,
+                    WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
                     class.as_ptr(),
                     wide_null("Sandbox+ Controller").as_ptr(),
-                    WS_OVERLAPPEDWINDOW,
-                    CW_USEDEFAULT,
-                    CW_USEDEFAULT,
-                    1,
-                    1,
+                    WS_POPUP | WS_VISIBLE,
+                    x,
+                    y,
+                    BUTTON_WIDTH,
+                    BUTTON_HEIGHT,
                     null_mut(),
                     null_mut::<std::ffi::c_void>() as HMENU,
                     instance,
@@ -556,6 +631,9 @@ mod controller {
             };
             if hwnd.is_null() {
                 return Err(last_error("CreateWindowExW(controller)"));
+            }
+            unsafe {
+                SetLayeredWindowAttributes(hwnd, 0, BUTTON_ALPHA, LWA_ALPHA);
             }
 
             Ok(Self { hwnd })
@@ -664,6 +742,7 @@ mod controller {
                 MENU_RETURN,
                 wide_null("Return to Host").as_ptr(),
             );
+            AppendMenuW(menu, MF_SEPARATOR, 0, null());
             AppendMenuW(
                 menu,
                 MF_STRING,
@@ -706,11 +785,85 @@ mod controller {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
-        if message == WM_DESTROY {
-            PostQuitMessage(0);
-            return 0;
+        match message {
+            WM_NCHITTEST => HTCAPTION,
+            WM_PAINT => {
+                paint_controller_button(hwnd);
+                0
+            }
+            WM_LBUTTONUP => {
+                if enter_desktop(None).is_ok() {
+                    InvalidateRect(hwnd, null(), TRUE);
+                }
+                0
+            }
+            WM_RBUTTONUP => {
+                if let Ok(command) = show_tray_menu(hwnd) {
+                    match command {
+                        MENU_ENTER => {
+                            let _ = enter_desktop(None);
+                        }
+                        MENU_RETURN => {
+                            let _ = return_to_host();
+                        }
+                        MENU_EXIT => {
+                            PostQuitMessage(0);
+                        }
+                        _ => {}
+                    }
+                }
+                0
+            }
+            WM_DESTROY => {
+                PostQuitMessage(0);
+                0
+            }
+            _ => DefWindowProcW(hwnd, message, wparam, lparam),
         }
-        unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+    }
+
+    fn has_active_session() -> bool {
+        super::active_instance().is_ok()
+    }
+
+    fn paint_controller_button(hwnd: HWND) {
+        let active = has_active_session();
+        let (bg, border, label) = if active {
+            (COLOR_READY, COLOR_READY_BORDER, "Enter Sandbox")
+        } else {
+            (COLOR_IDLE, COLOR_IDLE_BORDER, "No Session")
+        };
+
+        let mut paint: PAINTSTRUCT = unsafe { std::mem::zeroed() };
+        let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: BUTTON_WIDTH,
+            bottom: BUTTON_HEIGHT,
+        };
+        let bg_brush = unsafe { CreateSolidBrush(bg) };
+        let border_brush = unsafe { CreateSolidBrush(border) };
+        unsafe {
+            FillRect(hdc, &rect, bg_brush);
+            FrameRect(hdc, &rect, border_brush);
+            SetBkMode(hdc, TRANSPARENT as i32);
+            SetTextColor(hdc, 0x00ffffff);
+        }
+        let mut text_rect = rect;
+        let text = wide_null(label);
+        unsafe {
+            DrawTextW(
+                hdc,
+                text.as_ptr(),
+                -1,
+                &mut text_rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+            DeleteObject(bg_brush as _);
+            DeleteObject(border_brush as _);
+            EndPaint(hwnd, &paint);
+        }
     }
 
     struct Hotkey;

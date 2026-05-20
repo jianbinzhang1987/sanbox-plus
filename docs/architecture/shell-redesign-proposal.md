@@ -1020,6 +1020,63 @@ enum ShellAction {
 
 ## 五、迁移计划
 
+### 5.0 Phase 0 决策记录
+
+2026-05-20 复测结论：**方案 A 基础设施已修复，Agent + Notepad 验证通过，Explorer 退出码 1 待调查**。
+
+#### 修复 1: WinSta0 DACL（sandbox-desktop）
+
+`grant_desktop_access` 使用 `GetProcessWindowStation()` 获取窗口站句柄，但该 API 在
+Session 0 的 Windows Service 中返回的是服务自身的窗口站（如 `Service-0x0-3e7$`），
+而非交互式 `WinSta0`。修复：显式通过 `OpenWindowStationW("WinSta0")` 打开，并引入
+`WindowStationHandle` + `WindowStationGuard` RAII 管理。
+
+#### 修复 2: Token Session ID（sandbox-launcher）
+
+`LogonUser` 在 Session 0 服务进程中创建的 Token 会话 ID 为 0，`CreateProcessAsUserW`
+据此将子进程创建在 Session 0——无法访问交互式会话的 WinSta0 和沙箱桌面。修复：在创建
+子进程前调用 `WTSGetActiveConsoleSessionId()` + `SetTokenInformation(TokenSessionId)`
+将 Token 切换到交互式会话。
+
+#### 修复 3: 桌面 Handle 生命周期（sandbox-manager / sandbox-desktop）
+
+Manager 调用 `ensure_desktop` 创建沙箱桌面后立即关闭句柄，在 Service 的子进程创建前
+桌面可能被销毁。修复：新增 `DesktopGuard` 类型，Manager 在 `start_workspace` 期间
+持有桌面句柄，确保桌面在子进程附着前不被回收。同时 Manager 从交互式会话调用
+`grant_desktop_access`，确保修改的是交互式 WinSta0（而非 Session 0 的 WinSta0）。
+
+#### 修复 4: 进程初始化时序（sandbox-launcher）
+
+`WaitForInputIdle` 仅等待子进程创建消息队列，不等待完全完成桌面附着。Manager CLI
+进程在 IPC 返回后立即退出，关闭最后一个交互式桌面句柄，此时子进程可能尚未完全建立
+稳定的桌面引用，导致桌面被销毁、子进程崩溃。修复：在 `launch_with_credentials` 中
+添加 `WaitForSingleObject(child.process, 1000)` —— 最多等待 1 秒，如果子进程在此
+期间退出则记录退出码。这给子进程足够时间完成初始化并稳定附着到桌面，同时不影响正常
+流程（1 秒超时后直接返回）。
+
+注意：Session 0 的 Service 进程无法持有交互式桌面句柄（每个 Session 有独立的
+WinSta0），因此必须由 Launcher 内的等待机制或 Manager 进程的存活来保证桌面生命周期。
+
+#### 修复 5: SRP 策略级别（sandbox-service）
+
+SRP 白名单路径规则错误地写入 `CodeIdentifiers\0\Paths`（level 0 = DISALLOWED），
+应为 `CodeIdentifiers\262144\Paths`（level 262144 = UNRESTRICTED）。
+
+#### 修复 6: SetTokenInformation 权限处理（sandbox-launcher）
+
+前台模式运行时（非 LocalSystem），`SetTokenInformation(TokenSessionId)` 失败并返回
+ERROR_PRIVILEGE_NOT_HELD (1314)。修复：先检查 Token 当前 Session ID 是否已匹配目标
+Session，或在 1314 错误时静默返回 Ok。
+
+#### 验证结果
+
+- **sandbox-agent**: 作为 SandboxPlusUsr 在沙箱桌面上稳定运行（10 秒以上） ✅
+- **notepad.exe (launch-app)**: 通过 Service 以 SandboxPlusUsr 身份启动，Job Object
+  分配成功，进程持续运行（10 秒以上） ✅
+- **explorer.exe**: 进程成功创建并通过 `WaitForInputIdle`，但约 1 秒后以退出码 1 退出 ⚠️
+  - SRP 路径级别已修复（262144），但 Explorer 仍退出
+  - 待进一步调查 Explorer 特定策略或 `/separate` 参数行为
+
 ### 5.1 阶段划分
 
 ```text
@@ -1060,6 +1117,8 @@ Phase 3: 产品化完善（3-4 周）
   ├─ 文件交换 Broker 集成
   └─ 审计日志完善
 ```
+
+当前执行路线从 `Phase 1-alt` 开始。方案 A 代码和验证记录只作为 POC 资产保留，后续产品实现不应依赖 Explorer 作为沙箱 Shell。
 
 ### 5.2 Phase 0 验证清单
 

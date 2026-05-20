@@ -123,6 +123,12 @@ impl SandboxService {
                 Ok(IpcResponse::Apps(self.list_apps()))
             }
             IpcRequest::LaunchApp(request) => Ok(IpcResponse::LaunchApp(self.launch_app(request)?)),
+            IpcRequest::LaunchSystemProcess(request) => {
+                Ok(IpcResponse::LaunchApp(self.launch_system_process(request)?))
+            }
+            IpcRequest::RecoverWorkspace { sandbox_id } => {
+                Ok(IpcResponse::Processes(self.recover_workspace(&sandbox_id)?))
+            }
             IpcRequest::RecordProcess {
                 sandbox_id,
                 process,
@@ -141,6 +147,24 @@ impl SandboxService {
                 self.require_instance(&sandbox_id)?;
                 sandbox_desktop::switch_to_default_desktop()?;
                 Ok(IpcResponse::Ok)
+            }
+            IpcRequest::EnterSession { sandbox_id } => {
+                let instance = self.require_instance(&sandbox_id)?;
+                let desktop_name = instance.desktop_name.clone();
+                sandbox_desktop::switch_to_desktop(&desktop_name)?;
+                Ok(IpcResponse::Ok)
+            }
+            IpcRequest::ImportFiles { sandbox_id } => {
+                self.require_instance(&sandbox_id)?;
+                Err(SandboxError::UnsupportedPlatform(
+                    "file import broker is not implemented yet".to_string(),
+                ))
+            }
+            IpcRequest::ExportFiles { sandbox_id } => {
+                self.require_instance(&sandbox_id)?;
+                Err(SandboxError::UnsupportedPlatform(
+                    "file export broker is not implemented yet".to_string(),
+                ))
             }
             IpcRequest::ExportDiagnosticBundle { sandbox_id } => {
                 self.require_instance(&sandbox_id)?;
@@ -196,6 +220,7 @@ impl SandboxService {
         prepare_profile(&profile_root)?;
         prepare_explorer_workspace(&profile_root, &self.policy.apps)?;
         write_explorer_policy_reg(&profile_root)?;
+        write_srp_policy_reg(&profile_root, &self.policy.apps)?;
         apply_profile_acl(&profile_root, &user_sid)?;
         prepare_desktop_access(&desktop_name, &user_sid)?;
         self.network
@@ -305,8 +330,10 @@ impl SandboxService {
                 "cannot record process with pid 0".to_string(),
             ));
         }
-        if let Some(job) = &self.job {
-            job.assign_process(process.process_id)?;
+        if process.app_id.as_deref() != Some("sandbox-agent") {
+            if let Some(job) = &self.job {
+                job.assign_process(process.process_id)?;
+            }
         }
         self.processes.insert(process.process_id, process);
         Ok(())
@@ -370,6 +397,106 @@ impl SandboxService {
         Ok(response)
     }
 
+    pub fn launch_system_process(
+        &mut self,
+        request: LaunchAppRequest,
+    ) -> Result<LaunchAppResponse> {
+        let instance = self.require_instance(&request.sandbox_id)?;
+
+        if request.desktop_name != instance.desktop_name {
+            return Err(SandboxError::Denied(format!(
+                "system launch desktop '{}' does not match active desktop '{}'",
+                request.desktop_name, instance.desktop_name
+            )));
+        }
+
+        let executable = normalize_path_for_policy(&request.executable);
+        let import_profile_registry = request.app_id == "sandbox-explorer"
+            && !self.has_recorded_process("sandbox-explorer")
+            && !skip_profile_policy_import();
+        let allowed = match request.app_id.as_str() {
+            "sandbox-explorer" => {
+                executable
+                    == normalize_path_for_policy(std::path::Path::new(r"C:\Windows\explorer.exe"))
+                    && request.arguments.first().map(|s| s.as_str()) == Some("/separate")
+                    && request.arguments.len() <= 2
+            }
+            "sandbox-agent" => expected_system_helper_path("sandbox-agent.exe")
+                .map(|expected| normalize_path_for_policy(&request.executable) == expected)
+                .unwrap_or(false),
+            _ => false,
+        };
+        if !allowed {
+            return Err(SandboxError::Denied(format!(
+                "system process '{}' is not allowed",
+                request.app_id
+            )));
+        }
+
+        let mut options = self.launcher_options_for_instance();
+        options.import_profile_registry = import_profile_registry;
+        if matches!(
+            request.app_id.as_str(),
+            "sandbox-agent" | "sandbox-explorer"
+        ) {
+            options.job_handle = None;
+        }
+        if matches!(
+            request.app_id.as_str(),
+            "sandbox-agent" | "sandbox-explorer"
+        ) {
+            options.apply_profile_environment = false;
+        }
+        let response = sandbox_launcher::launch_app(request, options)?;
+        if response.process.process_id != 0 {
+            self.processes
+                .insert(response.process.process_id, response.process.clone());
+        }
+        self.write_audit(
+            AuditEventType::AppLaunched,
+            AuditResult::Success,
+            self.instance.as_ref(),
+            serde_json::json!({
+                "pid": response.process.process_id,
+                "app_id": response.process.app_id,
+                "executable": response.process.executable,
+                "system_process": true,
+            }),
+        )?;
+        Ok(response)
+    }
+
+    pub fn recover_workspace(&mut self, sandbox_id: &SandboxId) -> Result<Vec<ProcessInfo>> {
+        let instance = self.require_instance(sandbox_id)?.clone();
+        self.refresh_process_states();
+
+        let mut recovered = Vec::new();
+        if !self.has_running_process("sandbox-explorer") {
+            let response = self.launch_system_process(explorer_launch_request(&instance))?;
+            recovered.push(response.process);
+        }
+        if !self.has_running_process("sandbox-agent") {
+            let response = self.launch_system_process(agent_launch_request(&instance)?)?;
+            recovered.push(response.process);
+        }
+
+        if !recovered.is_empty() {
+            let state = if self.has_running_process("sandbox-explorer")
+                && self.has_running_process("sandbox-agent")
+            {
+                SandboxState::Running
+            } else {
+                SandboxState::Degraded
+            };
+            self.instance = Some(SandboxInstance {
+                state,
+                ..instance.clone()
+            });
+        }
+
+        Ok(recovered)
+    }
+
     pub fn shutdown(&mut self) {
         if let Some(instance) = self.instance.clone() {
             if !matches!(instance.state, SandboxState::Stopped | SandboxState::Error) {
@@ -395,8 +522,11 @@ impl SandboxService {
                 username: user.name.clone(),
                 domain: Some(".".to_string()),
                 password: user.password.clone(),
+                user_sid: user.sid.clone(),
             }),
             job_handle: self.job.as_ref().map(|job| job.raw),
+            import_profile_registry: false,
+            apply_profile_environment: true,
         }
     }
 
@@ -442,6 +572,22 @@ impl SandboxService {
                 process.state = ProcessState::Exited { exit_code };
             }
         }
+    }
+
+    fn has_recorded_process(&self, app_id: &str) -> bool {
+        self.processes
+            .values()
+            .any(|process| process.app_id.as_deref() == Some(app_id))
+    }
+
+    fn has_running_process(&self, app_id: &str) -> bool {
+        self.processes.values().any(|process| {
+            process.app_id.as_deref() == Some(app_id)
+                && matches!(
+                    process.state,
+                    ProcessState::Running | ProcessState::Starting
+                )
+        })
     }
 
     fn write_audit(
@@ -532,16 +678,10 @@ fn prepare_explorer_workspace(
         .join("Programs");
 
     for app in apps {
-        let filename = format!("{}.cmd", sanitize_shortcut_name(&app.name));
-        let launcher = build_cmd_launcher(&app.exe_path, &app.args);
+        let filename = format!("{}.lnk", sanitize_shortcut_name(&app.name));
         for dir in [&desktop_dir, &start_menu_dir] {
             let path = dir.join(&filename);
-            std::fs::write(&path, &launcher).map_err(|error| {
-                SandboxError::System(format!(
-                    "failed to create sandbox app launcher '{}': {error}",
-                    path.display()
-                ))
-            })?;
+            create_app_shortcut(&path, app)?;
         }
     }
 
@@ -552,6 +692,7 @@ fn write_explorer_policy_reg(profile_root: &std::path::Path) -> Result<()> {
     let path = profile_root.join("sandbox-explorer-policies.reg");
     let content = r#"Windows Registry Editor Version 5.00
 
+; === Explorer behavior lockdown ===
 [HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer]
 "NoRun"=dword:00000001
 "NoControlPanel"=dword:00000001
@@ -559,13 +700,45 @@ fn write_explorer_policy_reg(profile_root: &std::path::Path) -> Result<()> {
 "NoClose"=dword:00000001
 "NoStartMenuSubFolders"=dword:00000001
 "NoCommonGroups"=dword:00000001
+; Hide all drive letters (bitmask 0x03FFFFFF = all 26 drives)
+"NoDrives"=dword:03ffffff
+"NoViewOnDrive"=dword:00000000
 
+; === Disable system tools ===
 [HKEY_CURRENT_USER\Software\Policies\Microsoft\Windows\System]
 "DisableCMD"=dword:00000001
-"DisableRegistryTools"=dword:00000001
 
 [HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Policies\System]
 "DisableTaskMgr"=dword:00000001
+
+; === Visual identity: sandbox accent color + dark mode ===
+[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize]
+"EnableTransparency"=dword:00000000
+"AppsUseLightTheme"=dword:00000000
+"SystemUsesLightTheme"=dword:00000000
+
+[HKEY_CURRENT_USER\Software\Microsoft\Windows\DWM]
+; Sandbox brand accent color (amber/orange 0x00A85C00 -> ABGR for DWM: 0x005CA800)
+"AccentColor"=dword:005ca800
+"ColorizationColor"=dword:c4005ca8
+"ColorizationAfterglow"=dword:c4005ca8
+"ColorPrevalence"=dword:00000001
+"EnableWindowColorization"=dword:00000001
+"AccentColorInactive"=dword:004a4a4a
+
+; === Wallpaper: solid dark background to distinguish from host ===
+[HKEY_CURRENT_USER\Control Panel\Desktop]
+"Wallpaper"=""
+"WallpaperStyle"="0"
+"TileWallpaper"="0"
+
+[HKEY_CURRENT_USER\Control Panel\Colors]
+; Dark background RGB(32,32,32) for sandbox desktop
+"Background"="32 32 32"
+
+; Keep this at the end: setting it earlier can block later reg.exe imports.
+[HKEY_CURRENT_USER\Software\Policies\Microsoft\Windows\System]
+"DisableRegistryTools"=dword:00000001
 "#;
     std::fs::write(&path, content).map_err(|error| {
         SandboxError::System(format!(
@@ -575,20 +748,212 @@ fn write_explorer_policy_reg(profile_root: &std::path::Path) -> Result<()> {
     })
 }
 
-fn build_cmd_launcher(executable: &std::path::Path, args: &[String]) -> String {
-    let mut command = format!(
-        "start \"\" {}",
-        quote_cmd_arg(&executable.display().to_string())
+fn write_srp_policy_reg(
+    profile_root: &std::path::Path,
+    apps: &[sandbox_common::SandboxApp],
+) -> Result<()> {
+    let path = profile_root.join("sandbox-srp-policies.reg");
+    let mut content = String::from(
+        "Windows Registry Editor Version 5.00\r\n\r\n\
+         ; === Software Restriction Policies (SRP) ===\r\n\
+         ; DefaultLevel = DISALLOWED: block all executables unless whitelisted\r\n\
+         [HKEY_CURRENT_USER\\Software\\Policies\\Microsoft\\Windows\\Safer\\CodeIdentifiers]\r\n\
+         \"TransparentEnabled\"=dword:00000001\r\n\
+         \"PolicyScope\"=dword:00000000\r\n\
+         \"ExecutableTypes\"=hex(7):\\\r\n  \
+           57,00,53,00,43,00,00,00,\\\r\n  \
+           56,00,42,00,53,00,00,00,\\\r\n  \
+           50,00,53,00,31,00,00,00,\\\r\n  \
+           4f,00,43,00,58,00,00,00,\\\r\n  \
+           4d,00,53,00,54,00,00,00,\\\r\n  \
+           4d,00,53,00,49,00,00,00,\\\r\n  \
+           4d,00,44,00,45,00,00,00,\\\r\n  \
+           4d,00,44,00,42,00,00,00,\\\r\n  \
+           4c,00,4e,00,4b,00,00,00,\\\r\n  \
+           49,00,4e,00,53,00,00,00,\\\r\n  \
+           48,00,54,00,41,00,00,00,\\\r\n  \
+           45,00,58,00,45,00,00,00,\\\r\n  \
+           43,00,4d,00,44,00,00,00,\\\r\n  \
+           43,00,4f,00,4d,00,00,00,\\\r\n  \
+           42,00,41,00,54,00,00,00,\\\r\n  \
+           41,00,44,00,50,00,00,00,00,00\r\n\r\n",
     );
-    for arg in args {
-        command.push(' ');
-        command.push_str(&quote_cmd_arg(arg));
+
+    let system_paths = [
+        r"C:\Windows\explorer.exe",
+        r"C:\Windows\System32\ctfmon.exe",
+        r"C:\Windows\System32\cmd.exe",
+        r"C:\Windows\System32\dllhost.exe",
+        r"C:\Windows\System32\conhost.exe",
+        r"C:\Windows\System32\dwm.exe",
+        r"C:\Windows\System32\csrss.exe",
+        r"C:\Windows\System32\svchost.exe",
+        r"C:\Windows\System32\rundll32.exe",
+        r"C:\Windows\System32\reg.exe",
+        r"C:\Windows\System32\taskhostw.exe",
+        r"C:\Windows\System32\sihost.exe",
+    ];
+
+    let mut rule_index = 0u32;
+    for system_path in &system_paths {
+        write_srp_path_rule(&mut content, rule_index, system_path);
+        rule_index += 1;
     }
-    format!("@echo off\r\n{command}\r\n")
+
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(bin_dir) = current_exe.parent() {
+            for helper in [
+                "sandbox-agent.exe",
+                "sandbox-manager.exe",
+                "sandbox-service.exe",
+            ] {
+                write_srp_path_rule(
+                    &mut content,
+                    rule_index,
+                    &bin_dir.join(helper).display().to_string(),
+                );
+                rule_index += 1;
+            }
+        }
+    }
+
+    let desktop_dir = profile_root.join("Desktop");
+    let start_menu_dir = profile_root
+        .join("AppData")
+        .join("Roaming")
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs");
+
+    for app in apps {
+        let exe_path = app.exe_path.display().to_string();
+        write_srp_path_rule(&mut content, rule_index, &exe_path);
+        rule_index += 1;
+        for dir in [&desktop_dir, &start_menu_dir] {
+            let shortcut_path = dir.join(format!("{}.lnk", sanitize_shortcut_name(&app.name)));
+            write_srp_path_rule(
+                &mut content,
+                rule_index,
+                &shortcut_path.display().to_string(),
+            );
+            rule_index += 1;
+        }
+    }
+
+    content.push_str(
+        "; Enable SRP after all allow rules are present. Keeping this last prevents reg.exe from blocking itself during import.\r\n\
+         [HKEY_CURRENT_USER\\Software\\Policies\\Microsoft\\Windows\\Safer\\CodeIdentifiers]\r\n\
+         \"DefaultLevel\"=dword:00000000\r\n\r\n",
+    );
+
+    std::fs::write(&path, content).map_err(|error| {
+        SandboxError::System(format!(
+            "failed to write SRP policy template '{}': {error}",
+            path.display()
+        ))
+    })
 }
 
-fn quote_cmd_arg(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
+fn write_srp_path_rule(content: &mut String, index: u32, exe_path: &str) {
+    use std::fmt::Write;
+    let rule_guid = Uuid::new_v4();
+    let key = format!(
+        "HKEY_CURRENT_USER\\Software\\Policies\\Microsoft\\Windows\\Safer\\CodeIdentifiers\\262144\\Paths\\{{{rule_guid}}}"
+    );
+    let _ = write!(
+        content,
+        "; Rule {index}: {exe_path}\r\n\
+         [{key}]\r\n\
+         \"ItemData\"=\"{path_escaped}\"\r\n\
+         \"SaferFlags\"=dword:00000000\r\n\r\n",
+        path_escaped = exe_path.replace('\\', "\\\\"),
+    );
+}
+
+#[cfg(all(windows, not(test)))]
+fn create_app_shortcut(path: &std::path::Path, app: &sandbox_common::SandboxApp) -> Result<()> {
+    use std::process::Command;
+
+    let target = app.exe_path.display().to_string();
+    let arguments = app.args.join(" ");
+    let working_dir = app
+        .working_dir
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .or_else(|| app.exe_path.parent().map(|path| path.display().to_string()))
+        .unwrap_or_default();
+    let icon = app
+        .icon_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| target.clone());
+
+    let script = format!(
+        "$ws = New-Object -ComObject WScript.Shell; \
+         $s = $ws.CreateShortcut({}); \
+         $s.TargetPath = {}; \
+         $s.Arguments = {}; \
+         $s.WorkingDirectory = {}; \
+         $s.Description = {}; \
+         $s.IconLocation = {}; \
+         $s.Save()",
+        ps_single_quoted(&path.display().to_string()),
+        ps_single_quoted(&target),
+        ps_single_quoted(&arguments),
+        ps_single_quoted(&working_dir),
+        ps_single_quoted(&app.name),
+        ps_single_quoted(&icon),
+    );
+
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
+        .output()
+        .map_err(|error| {
+            SandboxError::System(format!(
+                "failed to create shortcut '{}': {error}",
+                path.display()
+            ))
+        })?;
+
+    if !output.status.success() {
+        return Err(SandboxError::System(format!(
+            "shortcut creation failed for '{}': {}{}",
+            path.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(any(not(windows), test))]
+fn create_app_shortcut(path: &std::path::Path, app: &sandbox_common::SandboxApp) -> Result<()> {
+    let mut content = format!(
+        "[InternetShortcut]\r\nURL=file://{}\r\n",
+        app.exe_path.display()
+    );
+    if !app.args.is_empty() {
+        content.push_str(&format!("; Arguments: {}\r\n", app.args.join(" ")));
+    }
+    std::fs::write(path, content).map_err(|error| {
+        SandboxError::System(format!(
+            "failed to create test shortcut '{}': {error}",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(all(windows, not(test)))]
+fn ps_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn sanitize_shortcut_name(value: &str) -> String {
@@ -606,6 +971,70 @@ fn sanitize_shortcut_name(value: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn normalize_path_for_policy(path: &std::path::Path) -> String {
+    path.display()
+        .to_string()
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
+fn expected_system_helper_path(name: &str) -> Option<String> {
+    let current = std::env::current_exe().ok()?;
+    let dir = current.parent()?;
+    Some(normalize_path_for_policy(&dir.join(name)))
+}
+
+fn skip_profile_policy_import() -> bool {
+    std::env::var("SANDBOX_PLUS_SKIP_PROFILE_POLICY")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn explorer_launch_request(instance: &SandboxInstance) -> LaunchAppRequest {
+    LaunchAppRequest {
+        sandbox_id: instance.id.clone(),
+        app_id: "sandbox-explorer".to_string(),
+        executable: PathBuf::from(r"C:\Windows\explorer.exe"),
+        arguments: vec!["/separate".to_string()],
+        working_directory: None,
+        desktop_name: instance.desktop_name.clone(),
+        profile_root: instance.profile_root.clone(),
+        environment_overrides: Vec::new(),
+        policy_version: instance.policy_version.clone(),
+    }
+}
+
+fn agent_launch_request(instance: &SandboxInstance) -> Result<LaunchAppRequest> {
+    let current = std::env::current_exe()
+        .map_err(|error| SandboxError::System(format!("failed to resolve current exe: {error}")))?;
+    let dir = current
+        .parent()
+        .ok_or_else(|| SandboxError::System("current exe has no parent".to_string()))?;
+    Ok(LaunchAppRequest {
+        sandbox_id: instance.id.clone(),
+        app_id: "sandbox-agent".to_string(),
+        executable: dir.join("sandbox-agent.exe"),
+        arguments: vec![
+            "--sandbox-id".to_string(),
+            instance.id.0.clone(),
+            "--desktop-name".to_string(),
+            instance.desktop_name.clone(),
+            "--log-path".to_string(),
+            instance
+                .profile_root
+                .join("Temp")
+                .join("sandbox-agent.log")
+                .display()
+                .to_string(),
+        ],
+        working_directory: None,
+        desktop_name: instance.desktop_name.clone(),
+        profile_root: instance.profile_root.clone(),
+        environment_overrides: Vec::new(),
+        policy_version: instance.policy_version.clone(),
+    })
 }
 
 fn dedicated_user_requested(value: &str) -> bool {
@@ -1075,6 +1504,59 @@ mod tests {
         assert_eq!(response.instance.id.0, "test");
         assert_eq!(response.instance.desktop_name, "Sandbox-Test");
         assert_eq!(response.instance.state, SandboxState::Ready);
+    }
+
+    #[test]
+    fn create_session_prepares_explorer_shortcuts_and_srp_rules() {
+        let profile_root =
+            std::env::temp_dir().join(format!("sandbox-plus-profile-{}", uuid::Uuid::new_v4()));
+        let app = SandboxApp {
+            id: "erp".to_string(),
+            name: "ERP System".to_string(),
+            exe_path: PathBuf::from(r"C:\Apps\ERP\erp.exe"),
+            args: vec!["--intranet".to_string()],
+            working_dir: Some(PathBuf::from(r"C:\Apps\ERP")),
+            icon_path: None,
+            hash_sha256: Some(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            ),
+            signer_thumbprint: None,
+            network_profile: NetworkProfile::IntranetOnly,
+            auto_start: false,
+        };
+        let policy = SandboxPolicy {
+            version: "test".to_string(),
+            apps: vec![app],
+            network: Default::default(),
+            filesystem: Default::default(),
+            clipboard: Default::default(),
+            printing: Default::default(),
+            audit: Default::default(),
+        };
+        let mut service = SandboxService::new(policy).expect("policy should be valid");
+
+        service
+            .create_session(CreateSessionRequest {
+                sandbox_id: Some(SandboxId("shortcut-test".to_string())),
+                user_sid: "S-1-5-21-test".to_string(),
+                desktop_name: Some("Sandbox-Shortcut-Test".to_string()),
+                profile_root: Some(profile_root.clone()),
+                policy_version: None,
+            })
+            .expect("session should be created");
+
+        let desktop_shortcut = profile_root.join(r"Desktop\ERP System.lnk");
+        let start_shortcut = profile_root
+            .join(r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\ERP System.lnk");
+        let srp = std::fs::read_to_string(profile_root.join("sandbox-srp-policies.reg"))
+            .expect("srp policy should be written");
+
+        assert!(desktop_shortcut.exists());
+        assert!(start_shortcut.exists());
+        assert!(srp.contains(r"C:\\Apps\\ERP\\erp.exe"));
+        assert!(srp.contains("ERP System.lnk"));
+
+        let _ = std::fs::remove_dir_all(profile_root);
     }
 
     #[test]

@@ -213,6 +213,7 @@ name = "sandbox-agent"
 version = "0.1.0"
 dependencies = [
  "sandbox-common",
+ "sandbox-desktop",
  "sandbox-ipc",
  "windows-sys",
 ]
