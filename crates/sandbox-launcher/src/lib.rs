@@ -106,9 +106,10 @@ mod platform {
         DESKTOP_SWITCHDESKTOP, DESKTOP_WRITEOBJECTS, HDESK,
     };
     use windows_sys::Win32::System::Threading::{
-        CreateProcessAsUserW, CreateProcessWithTokenW, GetCurrentProcess, OpenProcessToken,
-        ResumeThread, WaitForInputIdle, CREATE_BREAKAWAY_FROM_JOB, CREATE_SUSPENDED,
-        CREATE_UNICODE_ENVIRONMENT, LOGON_WITH_PROFILE, PROCESS_INFORMATION, STARTUPINFOW,
+        CreateProcessAsUserW, CreateProcessWithTokenW, GetCurrentProcess, OpenProcess,
+        OpenProcessToken, ResumeThread, WaitForInputIdle, CREATE_BREAKAWAY_FROM_JOB,
+        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, LOGON_WITH_PROFILE, PROCESS_INFORMATION,
+        PROCESS_SET_QUOTA, PROCESS_TERMINATE, STARTUPINFOW,
     };
     use windows_sys::Win32::UI::Shell::{LoadUserProfileW, PROFILEINFOW};
 
@@ -298,11 +299,29 @@ mod platform {
             };
 
             use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
-            let ok = unsafe { AssignProcessToJobObject(job_handle as _, self.process) };
+            let process =
+                unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, self.process_id) };
+            if process.is_null() {
+                return Err(last_error("OpenProcess(PROCESS_SET_QUOTA)"));
+            }
+            let ok = unsafe { AssignProcessToJobObject(job_handle as _, process) };
+            unsafe {
+                CloseHandle(process);
+            }
             if ok == 0 {
+                if self.is_already_in_job() {
+                    return Ok(false);
+                }
                 return Err(last_error("AssignProcessToJobObject"));
             }
             Ok(true)
+        }
+
+        fn is_already_in_job(&self) -> bool {
+            use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+            let mut result = 0;
+            let ok = unsafe { IsProcessInJob(self.process, null_mut(), &mut result) };
+            ok != 0 && result != 0
         }
 
         fn create_as_user(

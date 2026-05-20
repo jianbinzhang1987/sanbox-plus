@@ -30,15 +30,16 @@ graph TD
     end
 
     subgraph SandboxEnv [沙箱工作区 - Sandbox Desktop]
-        Shell[Sandbox Shell UI] <--> App[Sandbox App 1]
+        Shell[Sandbox Shell UI] <--> App1[Sandbox App 1]
         Shell <--> App2[Sandbox App 2]
     end
 
     Manager <-->|Named Pipe IPC| Service
     Shell <-->|Session Pipe IPC| Service
-    Launcher -->|CreateProcessAsUserW / Restricted Token| App
+    Launcher -->|CreateProcessAsUserW / Restricted Token| App1
     Launcher -->|Restricted Token| App2
-    App & App2 -->|Job Object / ACL / WFP| ServiceLayer
+    App1 -->|Job Object / ACL / WFP| ServiceLayer
+    App2 -->|Job Object / ACL / WFP| ServiceLayer
 ```
 
 ---
